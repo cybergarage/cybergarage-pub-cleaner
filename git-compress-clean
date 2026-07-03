@@ -66,8 +66,8 @@ def main() -> int:
         if not sys.stdin.isatty():
             print("Rerun with --yes to delete these directories.")
             return 1
-        answer = input("Delete these directories? Type 'delete' to continue: ").strip()
-        if answer != "delete":
+        answer = input("Delete these directories? Type 'y' to continue: ").strip().lower()
+        if answer != "y":
             print("Aborted.")
             return 1
 

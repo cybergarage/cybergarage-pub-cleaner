@@ -269,18 +269,9 @@ def record_repo_state(repo: Path, output_path: Path, heading: str) -> None:
     capture_command(repo, "git log --oneline -5", ["git", "log", "--oneline", "-5"], output_path)
 
 
-def remote_branch_oid(remote: str, branch: str) -> str:
-    result = run(["git", "ls-remote", remote, f"refs/heads/{branch}"])
-    line = result.stdout.strip().splitlines()
-    if not line:
-        raise RuntimeError(f"remote branch not found: {branch}")
-    return line[0].split()[0]
-
-
 def clone_remote(invocation: Invocation, work_dir: Path) -> tuple[Path, Path, str]:
     backup_dir = work_dir / f"{invocation.repo_name}.git"
     fresh_dir = work_dir / invocation.repo_name
-    expected_oid = remote_branch_oid(invocation.remote_url, invocation.branch)
 
     try:
         run(["git", "clone", "--mirror", invocation.remote_url, str(backup_dir)])
@@ -295,6 +286,7 @@ def clone_remote(invocation: Invocation, work_dir: Path) -> tuple[Path, Path, st
                 str(fresh_dir),
             ]
         )
+        expected_oid = run(["git", "rev-parse", "HEAD"], cwd=fresh_dir).stdout.strip()
     except RuntimeError:
         shutil.rmtree(backup_dir, ignore_errors=True)
         shutil.rmtree(fresh_dir, ignore_errors=True)
@@ -524,8 +516,8 @@ def ask_confirmation(args: argparse.Namespace, invocation: Invocation, fresh: Pa
     print(f"  branch: {invocation.branch}")
     print(f"  cloned repository to push: {fresh}")
     print("")
-    answer = input("Type 'rewrite history' to continue: ").strip()
-    if answer != "rewrite history":
+    answer = input("Type 'y' to continue: ").strip().lower()
+    if answer != "y":
         raise RuntimeError("aborted by user")
 
 
