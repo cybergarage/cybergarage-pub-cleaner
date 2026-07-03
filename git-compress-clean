@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+
+import argparse
+import shutil
+import sys
+from pathlib import Path
+
+
+def find_work_dirs(root: Path) -> list[Path]:
+    return sorted(
+        path
+        for path in root.glob("git-compress-*")
+        if path.is_dir()
+    )
+
+
+def human_size(path: Path) -> str:
+    total = 0
+    for item in path.rglob("*"):
+        try:
+            if item.is_file() or item.is_symlink():
+                total += item.lstat().st_size
+        except OSError:
+            pass
+
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    size = float(total)
+    for unit in units:
+        if size < 1024.0 or unit == units[-1]:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{total} B"
+        size /= 1024.0
+    return f"{total} B"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Remove git-compress-* work directories from the current directory."
+    )
+    parser.add_argument(
+        "--root",
+        default=".",
+        help="directory to scan (default: current directory)",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="delete matching directories without an interactive prompt",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    root = Path(args.root).resolve()
+    work_dirs = find_work_dirs(root)
+
+    if not work_dirs:
+        print(f"No git-compress-* work directories found under {root}.")
+        return 0
+
+    print("git-compress work directories:")
+    for work_dir in work_dirs:
+        print(f"  {human_size(work_dir):>10}  {work_dir}")
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print("Rerun with --yes to delete these directories.")
+            return 1
+        answer = input("Delete these directories? Type 'delete' to continue: ").strip()
+        if answer != "delete":
+            print("Aborted.")
+            return 1
+
+    for work_dir in work_dirs:
+        shutil.rmtree(work_dir)
+
+    print(f"Deleted {len(work_dirs)} git-compress work directories.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
