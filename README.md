@@ -16,7 +16,7 @@ Clean multiple target directories in one history rewrite:
 ./git-compress cybergarage-pub shared books/wb/books/act books/wb/golf
 ```
 
-The command creates a mirror backup and a clean working clone in a temporary directory, runs PNG compression and git-filter-repo outside the working repository, then pushes the rewritten branch with --force-with-lease after confirmation.
+The command creates a `git-compress-*` work directory in the current directory by default. That work directory contains a mirror backup, reports, and a clean working clone. The command runs PNG compression and git-filter-repo outside the working repository, then pushes the rewritten branch with --force-with-lease after confirmation. Use `--work-dir <path>` to choose an explicit location.
 
 Check a repository after cleanup:
 

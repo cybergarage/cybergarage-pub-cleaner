@@ -237,7 +237,7 @@ def create_work_dir(invocation: Invocation, work_dir_arg: Optional[str]) -> Path
         work_dir.mkdir(parents=True)
         return work_dir
 
-    return Path(tempfile.mkdtemp(prefix=work_dir_prefix(invocation), dir=tempfile.gettempdir()))
+    return Path(tempfile.mkdtemp(prefix=work_dir_prefix(invocation), dir=Path.cwd()))
 
 
 def write_text(path: Path, text: str) -> None:
@@ -627,7 +627,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--work-dir",
-        help="directory for reports, mirror backup, and cloned repository (default: system temp dir)",
+        help="directory for reports, mirror backup, and cloned repository (default: current directory)",
     )
     parser.add_argument(
         "--commit-message",
