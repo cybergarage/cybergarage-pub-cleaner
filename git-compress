@@ -1,0 +1,701 @@
+#!/usr/bin/env python3
+
+import argparse
+import datetime as dt
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Optional
+
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
+PNGQUANT_ARGS = ["--quality=65-90", "--ext", ".png", "--force"]
+
+
+@dataclass(frozen=True)
+class RunResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+@dataclass(frozen=True)
+class Invocation:
+    repo_name: str
+    target_rel: str
+    remote_url: str
+    branch: str
+    current_repo: Optional[Path]
+
+
+def eprint(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+def run(
+    args: list[str],
+    cwd: Optional[Path] = None,
+    check: bool = True,
+    input_text: Optional[str] = None,
+) -> RunResult:
+    proc = subprocess.run(
+        args,
+        cwd=str(cwd) if cwd else None,
+        input=input_text,
+        capture_output=True,
+        text=True,
+    )
+    result = RunResult(proc.returncode, proc.stdout, proc.stderr)
+    if check and proc.returncode != 0:
+        details = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"command failed: {' '.join(args)}\n{details}")
+    return result
+
+
+def command_exists(command: str) -> bool:
+    return shutil.which(command) is not None
+
+
+def print_install_help(missing: list[str]) -> None:
+    eprint("Error: required command(s) not found: " + ", ".join(missing))
+    eprint("")
+    eprint("Install examples:")
+    eprint("  macOS Homebrew:")
+    eprint("    brew install git pngquant git-filter-repo python")
+    eprint("")
+    eprint("  Ubuntu/Debian:")
+    eprint("    sudo apt-get update")
+    eprint("    sudo apt-get install -y git pngquant python3 git-filter-repo")
+    eprint("")
+    eprint("  If git-filter-repo is unavailable from apt:")
+    eprint("    python3 -m pip install --user git-filter-repo")
+    eprint("")
+    eprint("No commands were installed by this script.")
+
+
+def require_commands() -> None:
+    required = ["git", "pngquant", "git-filter-repo", "python3"]
+    missing = [cmd for cmd in required if not command_exists(cmd)]
+    if missing:
+        print_install_help(missing)
+        raise SystemExit(1)
+
+
+def maybe_repo_root() -> Optional[Path]:
+    result = run(["git", "rev-parse", "--show-toplevel"], check=False)
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    return Path(result.stdout.strip()).resolve()
+
+
+def current_branch(repo: Path) -> str:
+    result = run(["git", "symbolic-ref", "--quiet", "--short", "HEAD"], cwd=repo, check=False)
+    branch = result.stdout.strip()
+    if result.returncode != 0 or not branch:
+        raise RuntimeError("current repository must be on a branch, not detached HEAD")
+    return branch
+
+
+def origin_url(repo: Path) -> str:
+    result = run(["git", "remote", "get-url", "origin"], cwd=repo, check=False)
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError("origin remote is not configured")
+    return result.stdout.strip()
+
+
+def ensure_clean(repo: Path) -> None:
+    result = run(["git", "status", "--porcelain=v1"], cwd=repo)
+    if result.stdout.strip():
+        raise RuntimeError(
+            "working tree is not clean. Commit, stash, or remove these changes first:\n"
+            + result.stdout
+        )
+
+
+def ensure_local_matches_remote(repo: Path, branch: str) -> None:
+    print(f"Fetching origin/{branch} for safety check...")
+    run(["git", "fetch", "origin", branch], cwd=repo)
+    local = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    remote = run(["git", "rev-parse", f"origin/{branch}"], cwd=repo).stdout.strip()
+    if local != remote:
+        raise RuntimeError(
+            f"local HEAD does not match origin/{branch}.\n"
+            "Run git pull first, or resolve the difference before git-compress."
+        )
+
+
+def normalize_remote(repo_name: str, org: str) -> str:
+    if repo_name.startswith(("git@", "https://", "ssh://")):
+        return repo_name
+    if repo_name.endswith(".git") and "/" in repo_name:
+        return repo_name
+    return f"git@github.com:{org}/{repo_name}.git"
+
+
+def repo_name_from_remote(remote: str, fallback: str) -> str:
+    name = remote.rstrip("/").removesuffix(".git").split("/")[-1]
+    return name if name else fallback
+
+
+def ensure_target_arg(target_arg: str) -> str:
+    target = Path(target_arg)
+    if target.is_absolute():
+        raise RuntimeError("target directory must be a repository-relative path")
+    rel = target.as_posix().strip("/")
+    if not rel or rel == ".":
+        raise RuntimeError("target directory must not be the repository root")
+    if rel == ".git" or rel.startswith(".git/"):
+        raise RuntimeError("target directory must not be inside .git")
+    return rel
+
+
+def resolve_invocation(args: argparse.Namespace) -> Invocation:
+    cwd_repo = maybe_repo_root()
+
+    if len(args.items) == 1:
+        if not cwd_repo and not args.remote_url:
+            raise RuntimeError(
+                "outside a git repository, use: git-compress <repo-name-or-url> <target-dir>"
+            )
+        target_rel = ensure_target_arg(args.items[0])
+        if args.remote_url:
+            branch = args.branch or "main"
+            remote = args.remote_url
+            repo_name = repo_name_from_remote(remote, "repository")
+            return Invocation(repo_name, target_rel, remote, branch, cwd_repo)
+
+        assert cwd_repo is not None
+        target = cwd_repo / target_rel
+        if not target.exists() or not target.is_dir():
+            raise RuntimeError(f"target directory not found: {target_rel}")
+        branch = args.branch or current_branch(cwd_repo)
+        remote = origin_url(cwd_repo)
+        repo_name = repo_name_from_remote(remote, cwd_repo.name)
+        return Invocation(repo_name, target_rel, remote, branch, cwd_repo)
+
+    if len(args.items) == 2:
+        repo_name = args.items[0]
+        target_rel = ensure_target_arg(args.items[1])
+        remote = args.remote_url or normalize_remote(repo_name, args.org)
+        branch = args.branch or "main"
+        return Invocation(repo_name_from_remote(remote, repo_name), target_rel, remote, branch, cwd_repo)
+
+    raise RuntimeError("usage: git-compress [repo-name-or-url] <target-dir>")
+
+
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip("/"))
+    slug = slug.strip("-._")
+    return slug[:80] if slug else "target"
+
+
+def default_work_dir(invocation: Invocation) -> Path:
+    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    repo_slug = slugify(invocation.repo_name)
+    target_slug = slugify(invocation.target_rel)
+    return Path(tempfile.gettempdir()) / f"git-compress-{repo_slug}-{target_slug}-{timestamp}"
+
+
+def write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def append_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fp:
+        fp.write(text)
+
+
+def capture_command(repo: Path, title: str, args: list[str], output_path: Path) -> str:
+    result = run(args, cwd=repo, check=False)
+    body = result.stdout
+    if result.stderr:
+        body += result.stderr
+    block = f"$ {' '.join(args)}\n{body.rstrip()}\n"
+    append_text(output_path, f"## {title}\n\n```text\n{block}```\n\n")
+    return body
+
+
+def record_repo_state(repo: Path, output_path: Path, heading: str) -> None:
+    write_text(output_path, f"# {heading}\n\n")
+    capture_command(repo, "du -sh .git", ["du", "-sh", ".git"], output_path)
+    capture_command(repo, "git count-objects -vH", ["git", "count-objects", "-vH"], output_path)
+    capture_command(repo, "git status", ["git", "status"], output_path)
+    capture_command(repo, "git log --oneline -5", ["git", "log", "--oneline", "-5"], output_path)
+
+
+def remote_branch_oid(remote: str, branch: str) -> str:
+    result = run(["git", "ls-remote", remote, f"refs/heads/{branch}"])
+    line = result.stdout.strip().splitlines()
+    if not line:
+        raise RuntimeError(f"remote branch not found: {branch}")
+    return line[0].split()[0]
+
+
+def clone_remote(invocation: Invocation, work_dir: Path) -> tuple[Path, Path, str]:
+    backup_dir = work_dir / f"{invocation.repo_name}.git"
+    fresh_dir = work_dir / invocation.repo_name
+    expected_oid = remote_branch_oid(invocation.remote_url, invocation.branch)
+    run(["git", "clone", "--mirror", invocation.remote_url, str(backup_dir)])
+    run(
+        [
+            "git",
+            "clone",
+            "--branch",
+            invocation.branch,
+            "--single-branch",
+            invocation.remote_url,
+            str(fresh_dir),
+        ]
+    )
+    return backup_dir, fresh_dir, expected_oid
+
+
+def iter_png_files(target: Path) -> Iterable[Path]:
+    for root, dirs, files in os.walk(target):
+        dirs[:] = [name for name in dirs if name != ".git"]
+        for filename in files:
+            path = Path(root) / filename
+            if path.suffix.lower() == ".png":
+                yield path
+
+
+def write_size_list(repo: Path, files: list[Path], output_path: Path) -> dict[str, int]:
+    sizes: dict[str, int] = {}
+    lines = ["path\tsize_bytes\n"]
+    for path in sorted(files):
+        rel = path.relative_to(repo).as_posix()
+        size = path.stat().st_size if path.exists() else 0
+        sizes[rel] = size
+        lines.append(f"{rel}\t{size}\n")
+    write_text(output_path, "".join(lines))
+    return sizes
+
+
+def compress_pngs(repo: Path, target_rel: str, report_dir: Path) -> tuple[int, int, list[str]]:
+    target = repo / target_rel
+    if not target.exists() or not target.is_dir():
+        raise RuntimeError(f"target directory not found in cloned repository: {target_rel}")
+
+    pngs = sorted(iter_png_files(target))
+    before = write_size_list(repo, pngs, report_dir / "png-before.tsv")
+    failures: list[str] = []
+
+    for png in pngs:
+        result = run(["pngquant", *PNGQUANT_ARGS, str(png)], cwd=repo, check=False)
+        if result.returncode != 0:
+            rel = png.relative_to(repo).as_posix()
+            message = (result.stderr or result.stdout).strip()
+            failures.append(f"{rel}\t{result.returncode}\t{message}")
+
+    after = write_size_list(repo, pngs, report_dir / "png-after.tsv")
+
+    lines = ["path\tbefore_bytes\tafter_bytes\tsaved_bytes\tsaved_percent\n"]
+    compressed_count = 0
+    total_saved = 0
+    for rel in sorted(before):
+        before_size = before[rel]
+        after_size = after.get(rel, before_size)
+        saved = before_size - after_size
+        if saved > 0:
+            compressed_count += 1
+            total_saved += saved
+        saved_percent = (saved / before_size * 100.0) if before_size else 0.0
+        lines.append(f"{rel}\t{before_size}\t{after_size}\t{saved}\t{saved_percent:.2f}\n")
+    write_text(report_dir / "png-compression-report.tsv", "".join(lines))
+
+    failure_lines = ["path\treturn_code\tmessage\n"]
+    failure_lines.extend(line + "\n" for line in failures)
+    write_text(report_dir / "pngquant-failures.tsv", "".join(failure_lines))
+
+    return compressed_count, total_saved, failures
+
+
+def commit_png_changes(repo: Path, target_rel: str, message: str) -> bool:
+    status = run(["git", "status", "--porcelain=v1", "--", target_rel], cwd=repo)
+    if not status.stdout.strip():
+        print("No PNG compression changes to commit.")
+        return False
+
+    run(["git", "add", "--", target_rel], cwd=repo)
+    run(["git", "commit", "-m", message], cwd=repo)
+    return True
+
+
+def is_image_path(path: str) -> bool:
+    return Path(path).suffix.lower() in IMAGE_EXTS
+
+
+def parse_ls_tree_z(data: str) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    for record in data.split("\0"):
+        if not record:
+            continue
+        meta, path = record.split("\t", 1)
+        parts = meta.split()
+        if len(parts) >= 3 and parts[1] == "blob":
+            entries.append((parts[2], path))
+    return entries
+
+
+def head_image_blobs(repo: Path, pathspec: Optional[str] = None) -> list[tuple[str, str]]:
+    args = ["git", "ls-tree", "-rz", "-r", "HEAD"]
+    if pathspec:
+        args.extend(["--", pathspec])
+    result = run(args, cwd=repo)
+    return [(oid, path) for oid, path in parse_ls_tree_z(result.stdout) if is_image_path(path)]
+
+
+def historical_image_blobs(repo: Path, target_rel: str) -> dict[str, set[str]]:
+    result = run(["git", "rev-list", "--objects", "--all", "--", target_rel], cwd=repo)
+    blobs: dict[str, set[str]] = {}
+    object_ids: set[str] = set()
+
+    for line in result.stdout.splitlines():
+        if not line:
+            continue
+        cols = line.split(maxsplit=1)
+        if len(cols) != 2:
+            continue
+        oid, path = cols
+        if not is_image_path(path):
+            continue
+        blobs.setdefault(oid, set()).add(path)
+        object_ids.add(oid)
+
+    types = object_types(repo, sorted(object_ids))
+    return {oid: paths for oid, paths in blobs.items() if types.get(oid) == "blob"}
+
+
+def object_types(repo: Path, object_ids: list[str]) -> dict[str, str]:
+    if not object_ids:
+        return {}
+    result = run(
+        ["git", "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+        cwd=repo,
+        input_text="\n".join(object_ids) + "\n",
+    )
+    types: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        cols = line.split()
+        if len(cols) >= 2:
+            types[cols[0]] = cols[1]
+    return types
+
+
+def object_sizes(repo: Path, object_ids: Iterable[str]) -> dict[str, int]:
+    ids = sorted(set(object_ids))
+    if not ids:
+        return {}
+    result = run(
+        ["git", "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+        cwd=repo,
+        input_text="\n".join(ids) + "\n",
+    )
+    sizes: dict[str, int] = {}
+    for line in result.stdout.splitlines():
+        cols = line.split()
+        if len(cols) >= 3 and cols[1] == "blob":
+            sizes[cols[0]] = int(cols[2])
+    return sizes
+
+
+def classify_blobs(repo: Path, target_rel: str, report_dir: Path) -> tuple[set[str], int, int, int, bool]:
+    head_target = head_image_blobs(repo, target_rel)
+    head_all = head_image_blobs(repo)
+    historical = historical_image_blobs(repo, target_rel)
+
+    protected_head_blob_ids = {oid for oid, _ in head_all}
+    head_target_blob_ids = {oid for oid, _ in head_target}
+    strip_blob_ids = set(historical) - protected_head_blob_ids
+    protected_ok = not (head_target_blob_ids & strip_blob_ids)
+
+    strip_sizes = object_sizes(repo, strip_blob_ids)
+    strip_size_total = sum(strip_sizes.values())
+
+    write_text(report_dir / "head-target-images.tsv", format_blob_paths(head_target))
+    write_text(report_dir / "head-all-images.tsv", format_blob_paths(head_all))
+    write_text(report_dir / "historical-target-image-blobs.tsv", format_historical_blobs(historical))
+    write_text(report_dir / "strip-blob-ids.txt", "\n".join(sorted(strip_blob_ids)) + ("\n" if strip_blob_ids else ""))
+    write_text(report_dir / "strip-blob-report.tsv", format_strip_blobs(historical, strip_sizes, strip_blob_ids))
+
+    return strip_blob_ids, strip_size_total, len(head_target), len(head_target_blob_ids), protected_ok
+
+
+def format_blob_paths(entries: list[tuple[str, str]]) -> str:
+    lines = ["blob_id\tpath\n"]
+    for oid, path in sorted(entries, key=lambda item: (item[1], item[0])):
+        lines.append(f"{oid}\t{path}\n")
+    return "".join(lines)
+
+
+def format_historical_blobs(blobs: dict[str, set[str]]) -> str:
+    lines = ["blob_id\tpaths\n"]
+    for oid in sorted(blobs):
+        lines.append(f"{oid}\t{';'.join(sorted(blobs[oid]))}\n")
+    return "".join(lines)
+
+
+def format_strip_blobs(blobs: dict[str, set[str]], sizes: dict[str, int], strip_ids: set[str]) -> str:
+    lines = ["blob_id\tsize_bytes\tpaths\n"]
+    for oid in sorted(strip_ids):
+        lines.append(f"{oid}\t{sizes.get(oid, 0)}\t{';'.join(sorted(blobs.get(oid, [])))}\n")
+    return "".join(lines)
+
+
+def run_filter_repo(repo: Path, strip_ids_file: Path, remote: str) -> None:
+    if strip_ids_file.stat().st_size > 0:
+        run(["git", "filter-repo", "--strip-blobs-with-ids", str(strip_ids_file)], cwd=repo)
+    else:
+        print("No historical JPEG/PNG blobs need stripping for the target directory.")
+
+    remotes = run(["git", "remote"], cwd=repo).stdout.split()
+    if "origin" not in remotes:
+        run(["git", "remote", "add", "origin", remote], cwd=repo)
+
+    run(["git", "reflog", "expire", "--expire=now", "--all"], cwd=repo)
+    run(["git", "gc", "--prune=now", "--aggressive"], cwd=repo)
+
+
+def ask_confirmation(args: argparse.Namespace, invocation: Invocation, fresh: Path) -> None:
+    if args.yes or args.no_push:
+        return
+    if not sys.stdin.isatty():
+        raise RuntimeError("confirmation required; rerun with --yes in non-interactive mode")
+
+    print("")
+    print("This will rewrite remote history.")
+    print(f"  remote: {invocation.remote_url}")
+    print(f"  branch: {invocation.branch}")
+    print(f"  cloned repository to push: {fresh}")
+    print("")
+    answer = input("Type 'rewrite history' to continue: ").strip()
+    if answer != "rewrite history":
+        raise RuntimeError("aborted by user")
+
+
+def push_rewritten_history(repo: Path, branch: str, expected_old_oid: str) -> None:
+    lease = f"--force-with-lease=refs/heads/{branch}:{expected_old_oid}"
+    run(["git", "push", lease, "origin", f"HEAD:{branch}"], cwd=repo)
+
+
+def build_summary(
+    path: Path,
+    invocation: Invocation,
+    work_dir: Path,
+    backup_dir: Path,
+    fresh_dir: Path,
+    before_state: Path,
+    after_state: Path,
+    compressed_count: int,
+    png_saved: int,
+    failures: list[str],
+    strip_count: int,
+    strip_size: int,
+    head_image_file_count: int,
+    head_image_blob_count: int,
+    protected_ok: bool,
+    committed: bool,
+    pushed: bool,
+) -> None:
+    lines = [
+        "# git-compress summary",
+        "",
+        f"- Repository: `{invocation.repo_name}`",
+        f"- Target directory: `{invocation.target_rel}`",
+        f"- Branch: `{invocation.branch}`",
+        f"- Remote: `{invocation.remote_url}`",
+        f"- Work directory: `{work_dir}`",
+        f"- Mirror backup: `{backup_dir}`",
+        f"- Rewritten clone: `{fresh_dir}`",
+        f"- PNG compression commit created: `{str(committed).lower()}`",
+        f"- Rewritten history pushed: `{str(pushed).lower()}`",
+        f"- PNG files compressed: `{compressed_count}`",
+        f"- PNG compression saved bytes: `{png_saved}`",
+        f"- JPEG/PNG blob IDs selected for removal: `{strip_count}`",
+        f"- Approximate historical blob bytes selected for removal: `{strip_size}`",
+        f"- HEAD JPEG/PNG files under target: `{head_image_file_count}`",
+        f"- HEAD JPEG/PNG unique blobs under target: `{head_image_blob_count}`",
+        f"- HEAD target blobs absent from strip list: `{str(protected_ok).lower()}`",
+        f"- PNG compression failures: `{len(failures)}`",
+        "",
+        "## State Reports",
+        "",
+        f"- Before cleanup: `{before_state}`",
+        f"- After cleanup: `{after_state}`",
+        "",
+        "## Generated Files",
+        "",
+        "- `png-before.tsv`",
+        "- `png-after.tsv`",
+        "- `png-compression-report.tsv`",
+        "- `pngquant-failures.tsv`",
+        "- `head-target-images.tsv`",
+        "- `head-all-images.tsv`",
+        "- `historical-target-image-blobs.tsv`",
+        "- `strip-blob-ids.txt`",
+        "- `strip-blob-report.tsv`",
+        "",
+        "## Next Steps",
+        "",
+        "1. In existing clones, run `git pull --ff-only` first.",
+        "2. If pull reports divergent history, re-clone or reset to the rewritten remote branch.",
+        "3. Run `git-sizer --verbose` to verify the repository size.",
+        "",
+    ]
+    write_text(path, "\n".join(lines))
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compress PNG files under a target directory in a freshly cloned "
+            "repository, rewrite JPEG/PNG history, and push the cleaned branch."
+        )
+    )
+    parser.add_argument(
+        "items",
+        nargs="+",
+        help=(
+            "Either <target-dir> inside the current repository, or "
+            "<repo-name-or-url> <target-dir> outside it"
+        ),
+    )
+    parser.add_argument(
+        "--org",
+        default="cybergarage",
+        help="GitHub organization used when repo name is not a URL",
+    )
+    parser.add_argument(
+        "--branch",
+        help="branch to clean (default: current branch inside a repo, otherwise main)",
+    )
+    parser.add_argument(
+        "--work-dir",
+        help="directory for reports, mirror backup, and cloned repository (default: system temp dir)",
+    )
+    parser.add_argument(
+        "--commit-message",
+        help="PNG compression commit message",
+    )
+    parser.add_argument(
+        "--remote-url",
+        help="remote URL to clone and push",
+    )
+    parser.add_argument(
+        "--no-push",
+        action="store_true",
+        help="do everything except pushing rewritten history",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="skip the rewrite-history confirmation prompt",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    require_commands()
+
+    invocation = resolve_invocation(args)
+    if invocation.current_repo:
+        ensure_clean(invocation.current_repo)
+        ensure_local_matches_remote(invocation.current_repo, invocation.branch)
+
+    work_dir = Path(args.work_dir).resolve() if args.work_dir else default_work_dir(invocation)
+    report_dir = work_dir / "reports"
+    before_state = report_dir / "before-state.md"
+    after_state = report_dir / "after-state.md"
+    summary = work_dir / "summary.md"
+
+    if work_dir.exists():
+        raise RuntimeError(f"work directory already exists: {work_dir}")
+
+    print(f"Repository: {invocation.repo_name}")
+    print(f"Target directory: {invocation.target_rel}")
+    print(f"Branch: {invocation.branch}")
+    print(f"Remote: {invocation.remote_url}")
+    print(f"Work directory: {work_dir}")
+
+    print("Creating mirror backup and clean working clone...")
+    backup_dir, fresh_dir, expected_old_oid = clone_remote(invocation, work_dir)
+
+    print("Recording cloned repository state...")
+    record_repo_state(fresh_dir, before_state, "Before git-compress")
+
+    print("Compressing PNG files in the cloned repository...")
+    compressed_count, png_saved, failures = compress_pngs(fresh_dir, invocation.target_rel, report_dir)
+
+    print("Committing PNG compression result if files changed...")
+    commit_message = args.commit_message or f"Compress PNG assets under {invocation.target_rel}"
+    committed = commit_png_changes(fresh_dir, invocation.target_rel, commit_message)
+
+    print("Classifying JPEG/PNG blobs by blob ID...")
+    strip_ids, strip_size, head_file_count, head_blob_count, protected_ok = classify_blobs(
+        fresh_dir, invocation.target_rel, report_dir
+    )
+    if not protected_ok:
+        raise RuntimeError("internal safety check failed: a HEAD target blob was selected for stripping")
+
+    print("Running git-filter-repo in the cloned repository...")
+    run_filter_repo(fresh_dir, report_dir / "strip-blob-ids.txt", invocation.remote_url)
+
+    print("Recording post-cleanup repository state...")
+    record_repo_state(fresh_dir, after_state, "After git-compress cleanup")
+
+    pushed = False
+    if args.no_push:
+        print("Skipping push because --no-push was specified.")
+    else:
+        ask_confirmation(args, invocation, fresh_dir)
+        print("Pushing rewritten history with --force-with-lease...")
+        push_rewritten_history(fresh_dir, invocation.branch, expected_old_oid)
+        pushed = True
+
+    build_summary(
+        summary,
+        invocation,
+        work_dir,
+        backup_dir,
+        fresh_dir,
+        before_state,
+        after_state,
+        compressed_count,
+        png_saved,
+        failures,
+        len(strip_ids),
+        strip_size,
+        head_file_count,
+        head_blob_count,
+        protected_ok,
+        committed,
+        pushed,
+    )
+
+    print("")
+    print("Done.")
+    print(f"Summary: {summary}")
+    print(f"Mirror backup: {backup_dir}")
+    print(f"Rewritten clone: {fresh_dir}")
+    if pushed:
+        print("Existing clones can try `git pull --ff-only`.")
+        print("If Git reports divergent history, re-clone or reset to the rewritten branch.")
+    else:
+        print("No push was performed.")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except RuntimeError as exc:
+        eprint(f"Error: {exc}")
+        raise SystemExit(1)
