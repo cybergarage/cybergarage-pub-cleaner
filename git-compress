@@ -222,11 +222,22 @@ def target_label(target_rels: Sequence[str]) -> str:
     return f"{len(target_rels)}-targets"
 
 
-def default_work_dir(invocation: Invocation) -> Path:
+def work_dir_prefix(invocation: Invocation) -> str:
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     repo_slug = slugify(invocation.repo_name)
     target_slug = slugify(target_label(invocation.target_rels))
-    return Path(tempfile.gettempdir()) / f"git-compress-{repo_slug}-{target_slug}-{timestamp}"
+    return f"git-compress-{repo_slug}-{target_slug}-{timestamp}-"
+
+
+def create_work_dir(invocation: Invocation, work_dir_arg: Optional[str]) -> Path:
+    if work_dir_arg:
+        work_dir = Path(work_dir_arg).resolve()
+        if work_dir.exists():
+            raise RuntimeError(f"work directory already exists: {work_dir}")
+        work_dir.mkdir(parents=True)
+        return work_dir
+
+    return Path(tempfile.mkdtemp(prefix=work_dir_prefix(invocation), dir=tempfile.gettempdir()))
 
 
 def write_text(path: Path, text: str) -> None:
@@ -270,18 +281,25 @@ def clone_remote(invocation: Invocation, work_dir: Path) -> tuple[Path, Path, st
     backup_dir = work_dir / f"{invocation.repo_name}.git"
     fresh_dir = work_dir / invocation.repo_name
     expected_oid = remote_branch_oid(invocation.remote_url, invocation.branch)
-    run(["git", "clone", "--mirror", invocation.remote_url, str(backup_dir)])
-    run(
-        [
-            "git",
-            "clone",
-            "--branch",
-            invocation.branch,
-            "--single-branch",
-            invocation.remote_url,
-            str(fresh_dir),
-        ]
-    )
+
+    try:
+        run(["git", "clone", "--mirror", invocation.remote_url, str(backup_dir)])
+        run(
+            [
+                "git",
+                "clone",
+                "--branch",
+                invocation.branch,
+                "--single-branch",
+                invocation.remote_url,
+                str(fresh_dir),
+            ]
+        )
+    except RuntimeError:
+        shutil.rmtree(backup_dir, ignore_errors=True)
+        shutil.rmtree(fresh_dir, ignore_errors=True)
+        raise
+
     return backup_dir, fresh_dir, expected_oid
 
 
@@ -641,14 +659,11 @@ def main() -> int:
         ensure_clean(invocation.current_repo)
         ensure_local_matches_remote(invocation.current_repo, invocation.branch)
 
-    work_dir = Path(args.work_dir).resolve() if args.work_dir else default_work_dir(invocation)
+    work_dir = create_work_dir(invocation, args.work_dir)
     report_dir = work_dir / "reports"
     before_state = report_dir / "before-state.md"
     after_state = report_dir / "after-state.md"
     summary = work_dir / "summary.md"
-
-    if work_dir.exists():
-        raise RuntimeError(f"work directory already exists: {work_dir}")
 
     print(f"Repository: {invocation.repo_name}")
     print(f"Target directories: {', '.join(invocation.target_rels)}")
