@@ -10,7 +10,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
@@ -27,7 +27,7 @@ class RunResult:
 @dataclass(frozen=True)
 class Invocation:
     repo_name: str
-    target_rel: str
+    target_rels: list[str]
     remote_url: str
     branch: str
     current_repo: Optional[Path]
@@ -154,38 +154,60 @@ def ensure_target_arg(target_arg: str) -> str:
     return rel
 
 
+def unique_targets(target_args: Sequence[str]) -> list[str]:
+    targets: list[str] = []
+    seen: set[str] = set()
+    for target_arg in target_args:
+        target = ensure_target_arg(target_arg)
+        if target not in seen:
+            targets.append(target)
+            seen.add(target)
+    return targets
+
+
+def ensure_targets_exist(repo: Path, target_rels: Sequence[str]) -> None:
+    for target_rel in target_rels:
+        target = repo / target_rel
+        if not target.exists() or not target.is_dir():
+            raise RuntimeError(f"target directory not found: {target_rel}")
+
+
 def resolve_invocation(args: argparse.Namespace) -> Invocation:
     cwd_repo = maybe_repo_root()
 
-    if len(args.items) == 1:
-        if not cwd_repo and not args.remote_url:
-            raise RuntimeError(
-                "outside a git repository, use: git-compress <repo-name-or-url> <target-dir>"
-            )
-        target_rel = ensure_target_arg(args.items[0])
-        if args.remote_url:
-            branch = args.branch or "main"
-            remote = args.remote_url
-            repo_name = repo_name_from_remote(remote, "repository")
-            return Invocation(repo_name, target_rel, remote, branch, cwd_repo)
+    if args.remote_url:
+        if not args.items:
+            raise RuntimeError("usage with --remote-url: git-compress --remote-url <url> <target-dir> [...]")
+        target_rels = unique_targets(args.items)
+        branch = args.branch or "main"
+        remote = args.remote_url
+        repo_name = repo_name_from_remote(remote, "repository")
+        return Invocation(repo_name, target_rels, remote, branch, None)
 
-        assert cwd_repo is not None
-        target = cwd_repo / target_rel
-        if not target.exists() or not target.is_dir():
-            raise RuntimeError(f"target directory not found: {target_rel}")
+    if cwd_repo and len(args.items) >= 1:
         branch = args.branch or current_branch(cwd_repo)
         remote = origin_url(cwd_repo)
         repo_name = repo_name_from_remote(remote, cwd_repo.name)
-        return Invocation(repo_name, target_rel, remote, branch, cwd_repo)
 
-    if len(args.items) == 2:
+        if len(args.items) == 1:
+            target_rels = unique_targets(args.items)
+            ensure_targets_exist(cwd_repo, target_rels)
+            return Invocation(repo_name, target_rels, remote, branch, cwd_repo)
+
+        first_as_target = ensure_target_arg(args.items[0])
+        if (cwd_repo / first_as_target).is_dir():
+            target_rels = unique_targets(args.items)
+            ensure_targets_exist(cwd_repo, target_rels)
+            return Invocation(repo_name, target_rels, remote, branch, cwd_repo)
+
+    if len(args.items) >= 2:
         repo_name = args.items[0]
-        target_rel = ensure_target_arg(args.items[1])
-        remote = args.remote_url or normalize_remote(repo_name, args.org)
+        target_rels = unique_targets(args.items[1:])
+        remote = normalize_remote(repo_name, args.org)
         branch = args.branch or "main"
-        return Invocation(repo_name_from_remote(remote, repo_name), target_rel, remote, branch, cwd_repo)
+        return Invocation(repo_name_from_remote(remote, repo_name), target_rels, remote, branch, None)
 
-    raise RuntimeError("usage: git-compress [repo-name-or-url] <target-dir>")
+    raise RuntimeError("usage: git-compress [repo-name-or-url] <target-dir> [...]")
 
 
 def slugify(value: str) -> str:
@@ -194,10 +216,16 @@ def slugify(value: str) -> str:
     return slug[:80] if slug else "target"
 
 
+def target_label(target_rels: Sequence[str]) -> str:
+    if len(target_rels) == 1:
+        return target_rels[0]
+    return f"{len(target_rels)}-targets"
+
+
 def default_work_dir(invocation: Invocation) -> Path:
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     repo_slug = slugify(invocation.repo_name)
-    target_slug = slugify(invocation.target_rel)
+    target_slug = slugify(target_label(invocation.target_rels))
     return Path(tempfile.gettempdir()) / f"git-compress-{repo_slug}-{target_slug}-{timestamp}"
 
 
@@ -278,12 +306,15 @@ def write_size_list(repo: Path, files: list[Path], output_path: Path) -> dict[st
     return sizes
 
 
-def compress_pngs(repo: Path, target_rel: str, report_dir: Path) -> tuple[int, int, list[str]]:
-    target = repo / target_rel
-    if not target.exists() or not target.is_dir():
-        raise RuntimeError(f"target directory not found in cloned repository: {target_rel}")
+def compress_pngs(repo: Path, target_rels: Sequence[str], report_dir: Path) -> tuple[int, int, list[str]]:
+    png_set: set[Path] = set()
+    for target_rel in target_rels:
+        target = repo / target_rel
+        if not target.exists() or not target.is_dir():
+            raise RuntimeError(f"target directory not found in cloned repository: {target_rel}")
+        png_set.update(iter_png_files(target))
 
-    pngs = sorted(iter_png_files(target))
+    pngs = sorted(png_set)
     before = write_size_list(repo, pngs, report_dir / "png-before.tsv")
     failures: list[str] = []
 
@@ -317,13 +348,13 @@ def compress_pngs(repo: Path, target_rel: str, report_dir: Path) -> tuple[int, i
     return compressed_count, total_saved, failures
 
 
-def commit_png_changes(repo: Path, target_rel: str, message: str) -> bool:
-    status = run(["git", "status", "--porcelain=v1", "--", target_rel], cwd=repo)
+def commit_png_changes(repo: Path, target_rels: Sequence[str], message: str) -> bool:
+    status = run(["git", "status", "--porcelain=v1", "--", *target_rels], cwd=repo)
     if not status.stdout.strip():
         print("No PNG compression changes to commit.")
         return False
 
-    run(["git", "add", "--", target_rel], cwd=repo)
+    run(["git", "add", "--", *target_rels], cwd=repo)
     run(["git", "commit", "-m", message], cwd=repo)
     return True
 
@@ -344,16 +375,16 @@ def parse_ls_tree_z(data: str) -> list[tuple[str, str]]:
     return entries
 
 
-def head_image_blobs(repo: Path, pathspec: Optional[str] = None) -> list[tuple[str, str]]:
+def head_image_blobs(repo: Path, pathspecs: Optional[Sequence[str]] = None) -> list[tuple[str, str]]:
     args = ["git", "ls-tree", "-rz", "-r", "HEAD"]
-    if pathspec:
-        args.extend(["--", pathspec])
+    if pathspecs:
+        args.extend(["--", *pathspecs])
     result = run(args, cwd=repo)
     return [(oid, path) for oid, path in parse_ls_tree_z(result.stdout) if is_image_path(path)]
 
 
-def historical_image_blobs(repo: Path, target_rel: str) -> dict[str, set[str]]:
-    result = run(["git", "rev-list", "--objects", "--all", "--", target_rel], cwd=repo)
+def historical_image_blobs(repo: Path, target_rels: Sequence[str]) -> dict[str, set[str]]:
+    result = run(["git", "rev-list", "--objects", "--all", "--", *target_rels], cwd=repo)
     blobs: dict[str, set[str]] = {}
     object_ids: set[str] = set()
 
@@ -406,10 +437,10 @@ def object_sizes(repo: Path, object_ids: Iterable[str]) -> dict[str, int]:
     return sizes
 
 
-def classify_blobs(repo: Path, target_rel: str, report_dir: Path) -> tuple[set[str], int, int, int, bool]:
-    head_target = head_image_blobs(repo, target_rel)
+def classify_blobs(repo: Path, target_rels: Sequence[str], report_dir: Path) -> tuple[set[str], int, int, int, bool]:
+    head_target = head_image_blobs(repo, target_rels)
     head_all = head_image_blobs(repo)
-    historical = historical_image_blobs(repo, target_rel)
+    historical = historical_image_blobs(repo, target_rels)
 
     protected_head_blob_ids = {oid for oid, _ in head_all}
     head_target_blob_ids = {oid for oid, _ in head_target}
@@ -508,7 +539,7 @@ def build_summary(
         "# git-compress summary",
         "",
         f"- Repository: `{invocation.repo_name}`",
-        f"- Target directory: `{invocation.target_rel}`",
+        f"- Target directories: `{', '.join(invocation.target_rels)}`",
         f"- Branch: `{invocation.branch}`",
         f"- Remote: `{invocation.remote_url}`",
         f"- Work directory: `{work_dir}`",
@@ -555,7 +586,7 @@ def build_summary(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compress PNG files under a target directory in a freshly cloned "
+            "Compress PNG files under target directories in a freshly cloned "
             "repository, rewrite JPEG/PNG history, and push the cleaned branch."
         )
     )
@@ -563,8 +594,8 @@ def parse_args() -> argparse.Namespace:
         "items",
         nargs="+",
         help=(
-            "Either <target-dir> inside the current repository, or "
-            "<repo-name-or-url> <target-dir> outside it"
+            "Either <target-dir> [...] inside the current repository, or "
+            "<repo-name-or-url> <target-dir> [...] outside it"
         ),
     )
     parser.add_argument(
@@ -620,7 +651,7 @@ def main() -> int:
         raise RuntimeError(f"work directory already exists: {work_dir}")
 
     print(f"Repository: {invocation.repo_name}")
-    print(f"Target directory: {invocation.target_rel}")
+    print(f"Target directories: {', '.join(invocation.target_rels)}")
     print(f"Branch: {invocation.branch}")
     print(f"Remote: {invocation.remote_url}")
     print(f"Work directory: {work_dir}")
@@ -632,15 +663,15 @@ def main() -> int:
     record_repo_state(fresh_dir, before_state, "Before git-compress")
 
     print("Compressing PNG files in the cloned repository...")
-    compressed_count, png_saved, failures = compress_pngs(fresh_dir, invocation.target_rel, report_dir)
+    compressed_count, png_saved, failures = compress_pngs(fresh_dir, invocation.target_rels, report_dir)
 
     print("Committing PNG compression result if files changed...")
-    commit_message = args.commit_message or f"Compress PNG assets under {invocation.target_rel}"
-    committed = commit_png_changes(fresh_dir, invocation.target_rel, commit_message)
+    commit_message = args.commit_message or f"Compress PNG assets under {target_label(invocation.target_rels)}"
+    committed = commit_png_changes(fresh_dir, invocation.target_rels, commit_message)
 
     print("Classifying JPEG/PNG blobs by blob ID...")
     strip_ids, strip_size, head_file_count, head_blob_count, protected_ok = classify_blobs(
-        fresh_dir, invocation.target_rel, report_dir
+        fresh_dir, invocation.target_rels, report_dir
     )
     if not protected_ok:
         raise RuntimeError("internal safety check failed: a HEAD target blob was selected for stripping")
