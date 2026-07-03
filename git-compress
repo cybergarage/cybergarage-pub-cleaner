@@ -500,7 +500,7 @@ def format_strip_blobs(blobs: dict[str, set[str]], sizes: dict[str, int], strip_
 
 def run_filter_repo(repo: Path, strip_ids_file: Path, remote: str) -> None:
     if strip_ids_file.stat().st_size > 0:
-        run(["git", "filter-repo", "--strip-blobs-with-ids", str(strip_ids_file)], cwd=repo)
+        run(["git", "filter-repo", "--force", "--strip-blobs-with-ids", str(strip_ids_file)], cwd=repo)
     else:
         print("No historical JPEG/PNG blobs need stripping for the target directory.")
 
