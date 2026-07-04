@@ -33,3 +33,11 @@ Check a repository after cleanup:
 ./git-compress-chk
 ./git-compress-chk --blob-id e48b4914a5af65e4e8569be8c5aa9cfc05a7b50e
 ```
+
+Rebase an existing clone after `git-compress` rewrites remote history:
+
+```sh
+../cybergarage-pub-cleaner/git-compress-rebase 5635814e7d7e37bbd93cac539a5677ed7e8baff1
+```
+
+The argument is the old branch HEAD before cleanup. It is recorded as `Branch HEAD before rewrite` in the `git-compress` summary. The command requires a clean working tree, creates a temporary backup branch, fetches `origin/<branch>`, runs `git rebase --onto origin/<branch> <old-base> <branch>`, and deletes the backup branch after a successful rebase. Use `--keep-backup` to keep the backup branch.
