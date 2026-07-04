@@ -17,6 +17,7 @@ from typing import Iterable, Optional, Sequence
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
 PNGQUANT_ARGS = ["--quality=65-90", "--ext", ".png", "--force"]
+DEFAULT_MIN_PNG_SIZE = "1M"
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,17 @@ class Invocation:
 
 def eprint(message: str) -> None:
     print(message, file=sys.stderr)
+
+
+def parse_size(value: str) -> int:
+    match = re.fullmatch(r"\s*(\d+)([KkMmGg]?)\s*", value)
+    if not match:
+        raise argparse.ArgumentTypeError("size must be a non-negative integer, optionally followed by K, M, or G")
+
+    amount = int(match.group(1))
+    suffix = match.group(2).lower()
+    multipliers = {"": 1, "k": 1024, "m": 1024 * 1024, "g": 1024 * 1024 * 1024}
+    return amount * multipliers[suffix]
 
 
 def read_confirmation_key(prompt: str) -> str:
@@ -331,7 +343,12 @@ def write_size_list(repo: Path, files: list[Path], output_path: Path) -> dict[st
     return sizes
 
 
-def compress_pngs(repo: Path, target_rels: Sequence[str], report_dir: Path) -> tuple[int, int, list[str]]:
+def compress_pngs(
+    repo: Path,
+    target_rels: Sequence[str],
+    report_dir: Path,
+    min_png_size: int,
+) -> tuple[int, int, int, list[str]]:
     png_set: set[Path] = set()
     for target_rel in target_rels:
         target = repo / target_rel
@@ -341,9 +358,11 @@ def compress_pngs(repo: Path, target_rels: Sequence[str], report_dir: Path) -> t
 
     pngs = sorted(png_set)
     before = write_size_list(repo, pngs, report_dir / "png-before.tsv")
+    candidates = [png for png in pngs if before[png.relative_to(repo).as_posix()] >= min_png_size]
+    skipped_small = [png for png in pngs if before[png.relative_to(repo).as_posix()] < min_png_size]
     failures: list[str] = []
 
-    for png in pngs:
+    for png in candidates:
         result = run(["pngquant", *PNGQUANT_ARGS, str(png)], cwd=repo, check=False)
         if result.returncode != 0:
             rel = png.relative_to(repo).as_posix()
@@ -366,11 +385,17 @@ def compress_pngs(repo: Path, target_rels: Sequence[str], report_dir: Path) -> t
         lines.append(f"{rel}\t{before_size}\t{after_size}\t{saved}\t{saved_percent:.2f}\n")
     write_text(report_dir / "png-compression-report.tsv", "".join(lines))
 
+    skipped_lines = ["path\tsize_bytes\tthreshold_bytes\treason\n"]
+    for png in skipped_small:
+        rel = png.relative_to(repo).as_posix()
+        skipped_lines.append(f"{rel}\t{before[rel]}\t{min_png_size}\tsmaller-than-threshold\n")
+    write_text(report_dir / "png-skipped-small.tsv", "".join(skipped_lines))
+
     failure_lines = ["path\treturn_code\tmessage\n"]
     failure_lines.extend(line + "\n" for line in failures)
     write_text(report_dir / "pngquant-failures.tsv", "".join(failure_lines))
 
-    return compressed_count, total_saved, failures
+    return compressed_count, total_saved, len(skipped_small), failures
 
 
 def commit_png_changes(repo: Path, target_rels: Sequence[str], message: str) -> bool:
@@ -551,6 +576,8 @@ def build_summary(
     after_state: Path,
     compressed_count: int,
     png_saved: int,
+    png_skipped_small: int,
+    min_png_size: int,
     failures: list[str],
     strip_count: int,
     strip_size: int,
@@ -574,6 +601,8 @@ def build_summary(
         f"- Rewritten history pushed: `{str(pushed).lower()}`",
         f"- PNG files compressed: `{compressed_count}`",
         f"- PNG compression saved bytes: `{png_saved}`",
+        f"- PNG compression minimum size bytes: `{min_png_size}`",
+        f"- PNG files skipped below minimum size: `{png_skipped_small}`",
         f"- JPEG/PNG blob IDs selected for removal: `{strip_count}`",
         f"- Approximate historical blob bytes selected for removal: `{strip_size}`",
         f"- HEAD JPEG/PNG files under target: `{head_image_file_count}`",
@@ -591,6 +620,7 @@ def build_summary(
         "- `png-before.tsv`",
         "- `png-after.tsv`",
         "- `png-compression-report.tsv`",
+        "- `png-skipped-small.tsv`",
         "- `pngquant-failures.tsv`",
         "- `head-target-images.tsv`",
         "- `head-all-images.tsv`",
@@ -641,6 +671,15 @@ def parse_args() -> argparse.Namespace:
         help="PNG compression commit message",
     )
     parser.add_argument(
+        "--min-png-size",
+        default=DEFAULT_MIN_PNG_SIZE,
+        type=parse_size,
+        help=(
+            "minimum PNG size to compress (default: 1M; "
+            "use 0 to compress all PNG files)"
+        ),
+    )
+    parser.add_argument(
         "--remote-url",
         help="remote URL to clone and push",
     )
@@ -685,7 +724,12 @@ def main() -> int:
     record_repo_state(fresh_dir, before_state, "Before git-compress")
 
     print("Compressing PNG files in the cloned repository...")
-    compressed_count, png_saved, failures = compress_pngs(fresh_dir, invocation.target_rels, report_dir)
+    compressed_count, png_saved, png_skipped_small, failures = compress_pngs(
+        fresh_dir,
+        invocation.target_rels,
+        report_dir,
+        args.min_png_size,
+    )
 
     print("Committing PNG compression result if files changed...")
     commit_message = args.commit_message or f"Compress PNG assets under {target_label(invocation.target_rels)}"
@@ -723,6 +767,8 @@ def main() -> int:
         after_state,
         compressed_count,
         png_saved,
+        png_skipped_small,
+        args.min_png_size,
         failures,
         len(strip_ids),
         strip_size,
