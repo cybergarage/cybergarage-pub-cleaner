@@ -51,9 +51,29 @@ def ensure_clean(repo: Path) -> None:
         )
 
 
-def ensure_commit(repo: Path, value: str) -> str:
-    result = run(["git", "rev-parse", "--verify", f"{value}^{{commit}}"], cwd=repo)
-    return result.stdout.strip()
+def ensure_commit(repo: Path, value: str, label: str = "ref") -> str:
+    result = run(["git", "rev-parse", "--verify", f"{value}^{{commit}}"], cwd=repo, check=False)
+    if result.returncode == 0:
+        return result.stdout.strip()
+
+    details = result.stderr.strip() or result.stdout.strip()
+    message = f"{label} was not found as a commit in this repository: {value}"
+    if details:
+        message += f"\n\nGit said:\n{details}"
+    if label == "old base":
+        message += (
+            "\n\nThe old base must be the branch HEAD from before git-compress rewrote history. "
+            "It is printed by git-compress as 'Old base for git-compress-rebase' and recorded "
+            "as 'Branch HEAD before rewrite' in the summary."
+            "\n\nCommon causes:"
+            "\n  - this command is running in a different clone from the one that saw the old history"
+            "\n  - the old commit is already gone from this clone's object database"
+            "\n  - the branch was already rebased onto the rewritten history"
+            "\n\nHelpful checks:"
+            "\n  git reflog --all --date=iso"
+            "\n  git log --oneline --decorate --graph --all -20"
+        )
+    raise CommandError(message)
 
 
 def ensure_ancestor(repo: Path, ancestor: str, descendant: str, message: str) -> None:
@@ -130,22 +150,32 @@ def main() -> int:
         print(f"Fetching {args.remote}/{branch}...")
         run(["git", "fetch", args.remote, branch], cwd=repo)
 
-    old_base = ensure_commit(repo, args.old_base)
-    onto_oid = ensure_commit(repo, onto_ref)
-    branch_oid = ensure_commit(repo, branch)
+    old_base = ensure_commit(repo, args.old_base, "old base")
+    onto_oid = ensure_commit(repo, onto_ref, "onto ref")
+    branch_oid = ensure_commit(repo, branch, "branch")
 
     ensure_ancestor(
         repo,
         old_base,
         branch,
-        f"old base is not an ancestor of {branch}: {old_base}",
+        (
+            f"old base is not an ancestor of {branch}: {old_base}\n\n"
+            "This usually means the branch has already been rebased onto the rewritten "
+            "history, or the old base belongs to a different cleanup run/repository.\n\n"
+            "Helpful checks:\n"
+            f"  git merge-base --is-ancestor {old_base} {branch}\n"
+            f"  git log --oneline --decorate --graph {old_base}..{branch}\n"
+            "  git log --oneline --decorate --graph --all -20\n\n"
+            "If there are no local commits left to replay, no git-compress-rebase run is needed."
+        ),
     )
 
     local_count = int(run(["git", "rev-list", "--count", f"{old_base}..{branch}"], cwd=repo).stdout.strip())
     if local_count == 0:
         raise CommandError(
             f"no local commits found after old base {old_base}. "
-            f"Nothing to replay onto {onto_ref}."
+            f"Nothing to replay onto {onto_ref}.\n\n"
+            "The branch may already be up to date with the rewritten history."
         )
 
     backup = unique_backup_name(repo, args.backup_name)
