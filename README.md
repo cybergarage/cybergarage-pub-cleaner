@@ -1,6 +1,6 @@
 # cybergarage-pub-cleaner
 
-Tools for compressing PNG assets and cleaning old PNG/JPEG blobs from cybergarage-pub history.
+Tools for cleaning old PNG/JPEG blobs from cybergarage-pub history.
 
 ## Usage
 
@@ -16,9 +16,9 @@ Clean multiple target directories in one history rewrite:
 ./git-compress cybergarage-pub shared books/wb/books/act books/wb/golf
 ```
 
-The command creates a `git-compress-*` work directory in the current directory by default. That work directory contains a mirror backup, reports, and a clean working clone. The command runs PNG compression and git-filter-repo outside the working repository, then pushes the rewritten branch with --force-with-lease after confirmation. Use `--work-dir <path>` to choose an explicit location.
+The command creates a `git-compress-*` work directory in the current directory by default. That work directory contains a mirror backup, reports, and a clean working clone. The command uses git-filter-repo outside the working repository to remove historical PNG/JPEG blobs under the target directories while protecting the current HEAD image blobs.
 
-By default, PNG compression only rewrites PNG files that are at least 1 MiB. This avoids creating new Git blobs for already-small PNG files. Use `--min-png-size 0` to compress all PNG files, or values such as `512K`, `1M`, or `2M` to choose another threshold.
+After confirmation, the command preloads the rewritten history through temporary branches before updating the target branch with --force-with-lease. This splits large history rewrites into smaller pushes to avoid GitHub's per-pack size limit. Use `--push-chunk-size <commits>` to change the preload chunk size, or `--push-chunk-size 0` to disable preloading. Use `--work-dir <path>` to choose an explicit work directory.
 
 Remove generated work directories after verification:
 

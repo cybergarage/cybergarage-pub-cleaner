@@ -16,8 +16,7 @@ from typing import Iterable, Optional, Sequence
 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
-PNGQUANT_ARGS = ["--quality=65-90", "--ext", ".png", "--force"]
-DEFAULT_MIN_PNG_SIZE = "1M"
+DEFAULT_PUSH_CHUNK_SIZE = 1000
 
 
 @dataclass(frozen=True)
@@ -38,17 +37,6 @@ class Invocation:
 
 def eprint(message: str) -> None:
     print(message, file=sys.stderr)
-
-
-def parse_size(value: str) -> int:
-    match = re.fullmatch(r"\s*(\d+)([KkMmGg]?)\s*", value)
-    if not match:
-        raise argparse.ArgumentTypeError("size must be a non-negative integer, optionally followed by K, M, or G")
-
-    amount = int(match.group(1))
-    suffix = match.group(2).lower()
-    multipliers = {"": 1, "k": 1024, "m": 1024 * 1024, "g": 1024 * 1024 * 1024}
-    return amount * multipliers[suffix]
 
 
 def read_confirmation_key(prompt: str) -> str:
@@ -95,11 +83,11 @@ def print_install_help(missing: list[str]) -> None:
     eprint("")
     eprint("Install examples:")
     eprint("  macOS Homebrew:")
-    eprint("    brew install git pngquant git-filter-repo python")
+    eprint("    brew install git git-filter-repo python")
     eprint("")
     eprint("  Ubuntu/Debian:")
     eprint("    sudo apt-get update")
-    eprint("    sudo apt-get install -y git pngquant python3 git-filter-repo")
+    eprint("    sudo apt-get install -y git python3 git-filter-repo")
     eprint("")
     eprint("  If git-filter-repo is unavailable from apt:")
     eprint("    python3 -m pip install --user git-filter-repo")
@@ -108,7 +96,7 @@ def print_install_help(missing: list[str]) -> None:
 
 
 def require_commands() -> None:
-    required = ["git", "pngquant", "git-filter-repo", "python3"]
+    required = ["git", "git-filter-repo", "python3"]
     missing = [cmd for cmd in required if not command_exists(cmd)]
     if missing:
         print_install_help(missing)
@@ -324,93 +312,6 @@ def clone_remote(invocation: Invocation, work_dir: Path) -> tuple[Path, Path, st
     return backup_dir, fresh_dir, expected_oid
 
 
-def iter_png_files(target: Path) -> Iterable[Path]:
-    for root, dirs, files in os.walk(target):
-        dirs[:] = [name for name in dirs if name != ".git"]
-        for filename in files:
-            path = Path(root) / filename
-            if path.suffix.lower() == ".png":
-                yield path
-
-
-def write_size_list(repo: Path, files: list[Path], output_path: Path) -> dict[str, int]:
-    sizes: dict[str, int] = {}
-    lines = ["path\tsize_bytes\n"]
-    for path in sorted(files):
-        rel = path.relative_to(repo).as_posix()
-        size = path.stat().st_size if path.exists() else 0
-        sizes[rel] = size
-        lines.append(f"{rel}\t{size}\n")
-    write_text(output_path, "".join(lines))
-    return sizes
-
-
-def compress_pngs(
-    repo: Path,
-    target_rels: Sequence[str],
-    report_dir: Path,
-    min_png_size: int,
-) -> tuple[int, int, int, list[str]]:
-    png_set: set[Path] = set()
-    for target_rel in target_rels:
-        target = repo / target_rel
-        if not target.exists() or not target.is_dir():
-            raise RuntimeError(f"target directory not found in cloned repository: {target_rel}")
-        png_set.update(iter_png_files(target))
-
-    pngs = sorted(png_set)
-    before = write_size_list(repo, pngs, report_dir / "png-before.tsv")
-    candidates = [png for png in pngs if before[png.relative_to(repo).as_posix()] >= min_png_size]
-    skipped_small = [png for png in pngs if before[png.relative_to(repo).as_posix()] < min_png_size]
-    failures: list[str] = []
-
-    for png in candidates:
-        result = run(["pngquant", *PNGQUANT_ARGS, str(png)], cwd=repo, check=False)
-        if result.returncode != 0:
-            rel = png.relative_to(repo).as_posix()
-            message = (result.stderr or result.stdout).strip()
-            failures.append(f"{rel}\t{result.returncode}\t{message}")
-
-    after = write_size_list(repo, pngs, report_dir / "png-after.tsv")
-
-    lines = ["path\tbefore_bytes\tafter_bytes\tsaved_bytes\tsaved_percent\n"]
-    compressed_count = 0
-    total_saved = 0
-    for rel in sorted(before):
-        before_size = before[rel]
-        after_size = after.get(rel, before_size)
-        saved = before_size - after_size
-        if saved > 0:
-            compressed_count += 1
-            total_saved += saved
-        saved_percent = (saved / before_size * 100.0) if before_size else 0.0
-        lines.append(f"{rel}\t{before_size}\t{after_size}\t{saved}\t{saved_percent:.2f}\n")
-    write_text(report_dir / "png-compression-report.tsv", "".join(lines))
-
-    skipped_lines = ["path\tsize_bytes\tthreshold_bytes\treason\n"]
-    for png in skipped_small:
-        rel = png.relative_to(repo).as_posix()
-        skipped_lines.append(f"{rel}\t{before[rel]}\t{min_png_size}\tsmaller-than-threshold\n")
-    write_text(report_dir / "png-skipped-small.tsv", "".join(skipped_lines))
-
-    failure_lines = ["path\treturn_code\tmessage\n"]
-    failure_lines.extend(line + "\n" for line in failures)
-    write_text(report_dir / "pngquant-failures.tsv", "".join(failure_lines))
-
-    return compressed_count, total_saved, len(skipped_small), failures
-
-
-def commit_png_changes(repo: Path, target_rels: Sequence[str], message: str) -> bool:
-    status = run(["git", "status", "--porcelain=v1", "--", *target_rels], cwd=repo)
-    if not status.stdout.strip():
-        print("No PNG compression changes to commit.")
-        return False
-
-    run(["git", "add", "--", *target_rels], cwd=repo)
-    run(["git", "commit", "-m", message], cwd=repo)
-    return True
-
-
 def is_image_path(path: str) -> bool:
     return Path(path).suffix.lower() in IMAGE_EXTS
 
@@ -563,9 +464,50 @@ def ask_confirmation(args: argparse.Namespace, invocation: Invocation, fresh: Pa
         raise RuntimeError("aborted by user")
 
 
-def push_rewritten_history(repo: Path, branch: str, expected_old_oid: str) -> None:
+def cleanup_temp_refs(repo: Path, temp_refs: Sequence[str]) -> None:
+    for ref in reversed(temp_refs):
+        result = run(["git", "push", "origin", f":{ref}"], cwd=repo, check=False)
+        if result.returncode != 0:
+            details = result.stderr.strip() or result.stdout.strip()
+            eprint(f"Warning: failed to delete temporary ref {ref}: {details}")
+
+
+def preload_rewritten_history(repo: Path, chunk_size: int, temp_refs: list[str]) -> None:
+    if chunk_size <= 0:
+        print("Skipping temporary preload branches because --push-chunk-size=0.")
+        return
+
+    commits = run(["git", "rev-list", "--topo-order", "--reverse", "HEAD"], cwd=repo).stdout.splitlines()
+    if not commits:
+        return
+
+    checkpoints = [commits[index] for index in range(chunk_size - 1, len(commits), chunk_size)]
+    if checkpoints[-1] != commits[-1]:
+        checkpoints.append(commits[-1])
+
+    run_id = dt.datetime.now().strftime("%Y%m%d%H%M%S") + f"-{os.getpid()}"
+    print(
+        "Preloading rewritten history through temporary branches "
+        f"({len(checkpoints)} pushes, chunk size {chunk_size})..."
+    )
+    for index, oid in enumerate(checkpoints, start=1):
+        temp_ref = f"refs/heads/git-compress-preload-{run_id}-{index:04d}"
+        print(f"  preload {index}/{len(checkpoints)}: {temp_ref}")
+        run(["git", "push", "origin", f"{oid}:{temp_ref}"], cwd=repo)
+        temp_refs.append(temp_ref)
+
+
+def push_rewritten_history(repo: Path, branch: str, expected_old_oid: str, push_chunk_size: int) -> None:
+    temp_refs: list[str] = []
     lease = f"--force-with-lease=refs/heads/{branch}:{expected_old_oid}"
-    run(["git", "push", lease, "origin", f"HEAD:{branch}"], cwd=repo)
+    try:
+        preload_rewritten_history(repo, push_chunk_size, temp_refs)
+        print("Pushing final branch update with --force-with-lease...")
+        run(["git", "push", lease, "origin", f"HEAD:{branch}"], cwd=repo)
+    finally:
+        if temp_refs:
+            print("Deleting temporary preload branches...")
+            cleanup_temp_refs(repo, temp_refs)
 
 
 def build_summary(
@@ -576,17 +518,12 @@ def build_summary(
     fresh_dir: Path,
     before_state: Path,
     after_state: Path,
-    compressed_count: int,
-    png_saved: int,
-    png_skipped_small: int,
-    min_png_size: int,
-    failures: list[str],
+    push_chunk_size: int,
     strip_count: int,
     strip_size: int,
     head_image_file_count: int,
     head_image_blob_count: int,
     protected_ok: bool,
-    committed: bool,
     pushed: bool,
 ) -> None:
     lines = [
@@ -599,18 +536,13 @@ def build_summary(
         f"- Work directory: `{work_dir}`",
         f"- Mirror backup: `{backup_dir}`",
         f"- Rewritten clone: `{fresh_dir}`",
-        f"- PNG compression commit created: `{str(committed).lower()}`",
         f"- Rewritten history pushed: `{str(pushed).lower()}`",
-        f"- PNG files compressed: `{compressed_count}`",
-        f"- PNG compression saved bytes: `{png_saved}`",
-        f"- PNG compression minimum size bytes: `{min_png_size}`",
-        f"- PNG files skipped below minimum size: `{png_skipped_small}`",
+        f"- Temporary preload push chunk size: `{push_chunk_size}`",
         f"- JPEG/PNG blob IDs selected for removal: `{strip_count}`",
         f"- Approximate historical blob bytes selected for removal: `{strip_size}`",
         f"- HEAD JPEG/PNG files under target: `{head_image_file_count}`",
         f"- HEAD JPEG/PNG unique blobs under target: `{head_image_blob_count}`",
         f"- HEAD target blobs absent from strip list: `{str(protected_ok).lower()}`",
-        f"- PNG compression failures: `{len(failures)}`",
         "",
         "## State Reports",
         "",
@@ -619,11 +551,6 @@ def build_summary(
         "",
         "## Generated Files",
         "",
-        "- `png-before.tsv`",
-        "- `png-after.tsv`",
-        "- `png-compression-report.tsv`",
-        "- `png-skipped-small.tsv`",
-        "- `pngquant-failures.tsv`",
         "- `head-target-images.tsv`",
         "- `head-all-images.tsv`",
         "- `historical-target-image-blobs.tsv`",
@@ -643,8 +570,8 @@ def build_summary(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compress PNG files under target directories in a freshly cloned "
-            "repository, rewrite JPEG/PNG history, and push the cleaned branch."
+            "Remove old JPEG/PNG blobs under target directories from Git history "
+            "in a freshly cloned repository and push the cleaned branch."
         )
     )
     parser.add_argument(
@@ -669,21 +596,17 @@ def parse_args() -> argparse.Namespace:
         help="directory for reports, mirror backup, and cloned repository (default: current directory)",
     )
     parser.add_argument(
-        "--commit-message",
-        help="PNG compression commit message",
-    )
-    parser.add_argument(
-        "--min-png-size",
-        default=DEFAULT_MIN_PNG_SIZE,
-        type=parse_size,
-        help=(
-            "minimum PNG size to compress (default: 1M; "
-            "use 0 to compress all PNG files)"
-        ),
-    )
-    parser.add_argument(
         "--remote-url",
         help="remote URL to clone and push",
+    )
+    parser.add_argument(
+        "--push-chunk-size",
+        default=DEFAULT_PUSH_CHUNK_SIZE,
+        type=int,
+        help=(
+            "number of rewritten commits per temporary preload push "
+            f"(default: {DEFAULT_PUSH_CHUNK_SIZE}; use 0 to disable)"
+        ),
     )
     parser.add_argument(
         "--no-push",
@@ -700,6 +623,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.push_chunk_size < 0:
+        raise RuntimeError("--push-chunk-size must be 0 or greater")
     require_commands()
 
     invocation = resolve_invocation(args)
@@ -725,18 +650,6 @@ def main() -> int:
     print("Recording cloned repository state...")
     record_repo_state(fresh_dir, before_state, "Before git-compress")
 
-    print("Compressing PNG files in the cloned repository...")
-    compressed_count, png_saved, png_skipped_small, failures = compress_pngs(
-        fresh_dir,
-        invocation.target_rels,
-        report_dir,
-        args.min_png_size,
-    )
-
-    print("Committing PNG compression result if files changed...")
-    commit_message = args.commit_message or f"Compress PNG assets under {target_label(invocation.target_rels)}"
-    committed = commit_png_changes(fresh_dir, invocation.target_rels, commit_message)
-
     print("Classifying JPEG/PNG blobs by blob ID...")
     strip_ids, strip_size, head_file_count, head_blob_count, protected_ok = classify_blobs(
         fresh_dir, invocation.target_rels, report_dir
@@ -755,8 +668,8 @@ def main() -> int:
         print("Skipping push because --no-push was specified.")
     else:
         ask_confirmation(args, invocation, fresh_dir)
-        print("Pushing rewritten history with --force-with-lease...")
-        push_rewritten_history(fresh_dir, invocation.branch, expected_old_oid)
+        print("Pushing rewritten history with temporary preload branches...")
+        push_rewritten_history(fresh_dir, invocation.branch, expected_old_oid, args.push_chunk_size)
         pushed = True
 
     build_summary(
@@ -767,17 +680,12 @@ def main() -> int:
         fresh_dir,
         before_state,
         after_state,
-        compressed_count,
-        png_saved,
-        png_skipped_small,
-        args.min_png_size,
-        failures,
+        args.push_chunk_size,
         len(strip_ids),
         strip_size,
         head_file_count,
         head_blob_count,
         protected_ok,
-        committed,
         pushed,
     )
 
