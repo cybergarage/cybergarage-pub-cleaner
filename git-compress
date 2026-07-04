@@ -16,7 +16,7 @@ from typing import Iterable, Optional, Sequence
 
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
-DEFAULT_PUSH_CHUNK_SIZE = 1000
+DEFAULT_PUSH_CHUNK_SIZE = 100
 
 
 @dataclass(frozen=True)
