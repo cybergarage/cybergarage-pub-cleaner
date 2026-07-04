@@ -14,11 +14,13 @@ def read_confirmation_key(prompt: str) -> str:
     old_settings = termios.tcgetattr(fd)
     try:
         tty.setcbreak(fd)
-        answer = sys.stdin.read(1)
+        while True:
+            answer = sys.stdin.read(1).lower()
+            if answer in {"y", "n"}:
+                print(answer)
+                return answer
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-    print(answer)
-    return answer.lower()
 
 
 def find_work_dirs(root: Path) -> list[Path]:
@@ -81,7 +83,7 @@ def main() -> int:
         if not sys.stdin.isatty():
             print("Rerun with --yes to delete these directories.")
             return 1
-        answer = read_confirmation_key("Delete these directories? Press 'y' to continue: ")
+        answer = read_confirmation_key("Delete these directories? Press 'y' to continue, 'n' to cancel: ")
         if answer != "y":
             print("Aborted.")
             return 1

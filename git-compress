@@ -57,11 +57,13 @@ def read_confirmation_key(prompt: str) -> str:
     old_settings = termios.tcgetattr(fd)
     try:
         tty.setcbreak(fd)
-        answer = sys.stdin.read(1)
+        while True:
+            answer = sys.stdin.read(1).lower()
+            if answer in {"y", "n"}:
+                print(answer)
+                return answer
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-    print(answer)
-    return answer.lower()
 
 
 def run(
@@ -556,7 +558,7 @@ def ask_confirmation(args: argparse.Namespace, invocation: Invocation, fresh: Pa
     print(f"  branch: {invocation.branch}")
     print(f"  cloned repository to push: {fresh}")
     print("")
-    answer = read_confirmation_key("Press 'y' to continue: ")
+    answer = read_confirmation_key("Press 'y' to continue, 'n' to cancel: ")
     if answer != "y":
         raise RuntimeError("aborted by user")
 
