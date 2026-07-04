@@ -40,4 +40,4 @@ Rebase an existing clone after `git-compress` rewrites remote history:
 ../cybergarage-pub-cleaner/git-compress-rebase 5635814e7d7e37bbd93cac539a5677ed7e8baff1
 ```
 
-The argument is the old branch HEAD before cleanup. It is recorded as `Branch HEAD before rewrite` in the `git-compress` summary. The command requires a clean working tree, creates a temporary backup branch, fetches `origin/<branch>`, runs `git rebase --onto origin/<branch> <old-base> <branch>`, and deletes the backup branch after a successful rebase. Use `--keep-backup` to keep the backup branch.
+The argument is the old branch HEAD before cleanup. It is printed as `Old base for git-compress-rebase` when `git-compress` finishes, and is also recorded as `Branch HEAD before rewrite` in the summary. The command requires a clean working tree, creates a temporary backup branch, fetches `origin/<branch>`, runs `git rebase --onto origin/<branch> <old-base> <branch>`, and deletes the backup branch after a successful rebase. Use `--keep-backup` to keep the backup branch.

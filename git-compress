@@ -697,8 +697,10 @@ def main() -> int:
     print(f"Summary: {summary}")
     print(f"Mirror backup: {backup_dir}")
     print(f"Rewritten clone: {fresh_dir}")
+    print(f"Old base for git-compress-rebase: {expected_old_oid}")
     if pushed:
         print("Existing clones can try `git pull --ff-only`.")
+        print(f"Then run `git-compress-rebase {expected_old_oid}` if the branch diverged.")
         print("If Git reports divergent history, re-clone or reset to the rewritten branch.")
     else:
         print("No push was performed.")
