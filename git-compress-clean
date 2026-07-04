@@ -3,7 +3,22 @@
 import argparse
 import shutil
 import sys
+import termios
+import tty
 from pathlib import Path
+
+
+def read_confirmation_key(prompt: str) -> str:
+    print(prompt, end="", flush=True)
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        answer = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    print(answer)
+    return answer.lower()
 
 
 def find_work_dirs(root: Path) -> list[Path]:
@@ -66,7 +81,7 @@ def main() -> int:
         if not sys.stdin.isatty():
             print("Rerun with --yes to delete these directories.")
             return 1
-        answer = input("Delete these directories? Type 'y' to continue: ").strip().lower()
+        answer = read_confirmation_key("Delete these directories? Press 'y' to continue: ")
         if answer != "y":
             print("Aborted.")
             return 1

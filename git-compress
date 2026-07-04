@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import termios
+import tty
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
@@ -35,6 +37,19 @@ class Invocation:
 
 def eprint(message: str) -> None:
     print(message, file=sys.stderr)
+
+
+def read_confirmation_key(prompt: str) -> str:
+    print(prompt, end="", flush=True)
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        answer = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    print(answer)
+    return answer.lower()
 
 
 def run(
@@ -516,7 +531,7 @@ def ask_confirmation(args: argparse.Namespace, invocation: Invocation, fresh: Pa
     print(f"  branch: {invocation.branch}")
     print(f"  cloned repository to push: {fresh}")
     print("")
-    answer = input("Type 'y' to continue: ").strip().lower()
+    answer = read_confirmation_key("Press 'y' to continue: ")
     if answer != "y":
         raise RuntimeError("aborted by user")
 
