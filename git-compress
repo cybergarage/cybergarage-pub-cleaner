@@ -448,10 +448,10 @@ def run_filter_repo(repo: Path, strip_ids_file: Path, remote: str) -> None:
 
 
 def ask_confirmation(args: argparse.Namespace, invocation: Invocation, fresh: Path) -> None:
-    if args.yes or args.no_push:
+    if not args.confirm or args.no_push:
         return
     if not sys.stdin.isatty():
-        raise RuntimeError("confirmation required; rerun with --yes in non-interactive mode")
+        raise RuntimeError("confirmation required; rerun without --confirm in non-interactive mode")
 
     print("")
     print("This will rewrite remote history.")
@@ -616,9 +616,14 @@ def parse_args() -> argparse.Namespace:
         help="do everything except pushing rewritten history",
     )
     parser.add_argument(
+        "--confirm",
+        action="store_true",
+        help="ask for y/n confirmation before pushing rewritten history",
+    )
+    parser.add_argument(
         "--yes",
         action="store_true",
-        help="skip the rewrite-history confirmation prompt",
+        help="deprecated no-op; confirmation is skipped by default",
     )
     return parser.parse_args()
 
