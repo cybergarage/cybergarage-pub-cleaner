@@ -336,6 +336,28 @@ def head_image_blobs(repo: Path, pathspecs: Optional[Sequence[str]] = None) -> l
     return [(oid, path) for oid, path in parse_ls_tree_z(result.stdout) if is_image_path(path)]
 
 
+def head_paths(repo: Path) -> set[str]:
+    result = run(["git", "ls-tree", "-rz", "-r", "--name-only", "HEAD"], cwd=repo)
+    return {path for path in result.stdout.split("\0") if path}
+
+
+def historical_image_paths(repo: Path, target_rels: Sequence[str]) -> set[str]:
+    result = run(
+        [
+            "git",
+            "log",
+            "--all",
+            "--pretty=format:",
+            "--name-only",
+            "--diff-filter=ACMR",
+            "--",
+            *target_rels,
+        ],
+        cwd=repo,
+    )
+    return {line.strip() for line in result.stdout.splitlines() if is_image_path(line.strip())}
+
+
 def historical_image_blobs(repo: Path, target_rels: Sequence[str]) -> dict[str, set[str]]:
     result = run(["git", "rev-list", "--objects", "--all", "--", *target_rels], cwd=repo)
     blobs: dict[str, set[str]] = {}
@@ -390,13 +412,20 @@ def object_sizes(repo: Path, object_ids: Iterable[str]) -> dict[str, int]:
     return sizes
 
 
-def classify_blobs(repo: Path, target_rels: Sequence[str], report_dir: Path) -> tuple[set[str], int, int, int, bool]:
+def classify_blobs(
+    repo: Path,
+    target_rels: Sequence[str],
+    report_dir: Path,
+) -> tuple[set[str], set[str], int, int, int, bool]:
     head_target = head_image_blobs(repo, target_rels)
     head_all = head_image_blobs(repo)
+    protected_head_paths = head_paths(repo)
+    historical_paths = historical_image_paths(repo, target_rels)
     historical = historical_image_blobs(repo, target_rels)
 
     protected_head_blob_ids = {oid for oid, _ in head_all}
     head_target_blob_ids = {oid for oid, _ in head_target}
+    deleted_image_paths = historical_paths - protected_head_paths
     strip_blob_ids = set(historical) - protected_head_blob_ids
     protected_ok = not (head_target_blob_ids & strip_blob_ids)
 
@@ -405,11 +434,17 @@ def classify_blobs(repo: Path, target_rels: Sequence[str], report_dir: Path) -> 
 
     write_text(report_dir / "head-target-images.tsv", format_blob_paths(head_target))
     write_text(report_dir / "head-all-images.tsv", format_blob_paths(head_all))
+    write_text(report_dir / "historical-target-image-paths.txt", format_paths(historical_paths))
+    write_text(report_dir / "deleted-target-image-paths.txt", format_paths(deleted_image_paths))
     write_text(report_dir / "historical-target-image-blobs.tsv", format_historical_blobs(historical))
     write_text(report_dir / "strip-blob-ids.txt", "\n".join(sorted(strip_blob_ids)) + ("\n" if strip_blob_ids else ""))
     write_text(report_dir / "strip-blob-report.tsv", format_strip_blobs(historical, strip_sizes, strip_blob_ids))
 
-    return strip_blob_ids, strip_size_total, len(head_target), len(head_target_blob_ids), protected_ok
+    return strip_blob_ids, deleted_image_paths, strip_size_total, len(head_target), len(head_target_blob_ids), protected_ok
+
+
+def format_paths(paths: Iterable[str]) -> str:
+    return "".join(f"{path}\n" for path in sorted(paths))
 
 
 def format_blob_paths(entries: list[tuple[str, str]]) -> str:
@@ -433,7 +468,22 @@ def format_strip_blobs(blobs: dict[str, set[str]], sizes: dict[str, int], strip_
     return "".join(lines)
 
 
-def run_filter_repo(repo: Path, strip_ids_file: Path, remote: str) -> None:
+def run_filter_repo(repo: Path, strip_ids_file: Path, deleted_paths_file: Path, remote: str) -> None:
+    if deleted_paths_file.stat().st_size > 0:
+        run(
+            [
+                "git",
+                "filter-repo",
+                "--force",
+                "--paths-from-file",
+                str(deleted_paths_file),
+                "--invert-paths",
+            ],
+            cwd=repo,
+        )
+    else:
+        print("No HEAD-absent historical JPEG/PNG paths need removing for the target directory.")
+
     if strip_ids_file.stat().st_size > 0:
         run(["git", "filter-repo", "--force", "--strip-blobs-with-ids", str(strip_ids_file)], cwd=repo)
     else:
@@ -521,6 +571,7 @@ def build_summary(
     after_state: Path,
     push_chunk_size: int,
     strip_count: int,
+    deleted_path_count: int,
     strip_size: int,
     head_image_file_count: int,
     head_image_blob_count: int,
@@ -540,6 +591,7 @@ def build_summary(
         f"- Branch HEAD before rewrite: `{old_branch_head}`",
         f"- Rewritten history pushed: `{str(pushed).lower()}`",
         f"- Temporary preload push chunk size: `{push_chunk_size}`",
+        f"- HEAD-absent historical JPEG/PNG paths removed: `{deleted_path_count}`",
         f"- JPEG/PNG blob IDs selected for removal: `{strip_count}`",
         f"- Approximate historical blob bytes selected for removal: `{strip_size}`",
         f"- HEAD JPEG/PNG files under target: `{head_image_file_count}`",
@@ -555,6 +607,8 @@ def build_summary(
         "",
         "- `head-target-images.tsv`",
         "- `head-all-images.tsv`",
+        "- `historical-target-image-paths.txt`",
+        "- `deleted-target-image-paths.txt`",
         "- `historical-target-image-blobs.tsv`",
         "- `strip-blob-ids.txt`",
         "- `strip-blob-report.tsv`",
@@ -563,7 +617,8 @@ def build_summary(
         "",
         "1. In existing clones, run `git pull --ff-only` first.",
         "2. If pull reports divergent history, re-clone or reset to the rewritten remote branch.",
-        "3. Run `git-sizer --verbose` to verify the repository size.",
+        "3. Prefer the rewritten clone, or a fresh clone, when running `git-sizer --verbose`.",
+        "4. Old stash, remote-tracking, or other local refs can still keep pre-rewrite objects reachable.",
         "",
     ]
     write_text(path, "\n".join(lines))
@@ -657,15 +712,20 @@ def main() -> int:
     print("Recording cloned repository state...")
     record_repo_state(fresh_dir, before_state, "Before git-compress")
 
-    print("Classifying JPEG/PNG blobs by blob ID...")
-    strip_ids, strip_size, head_file_count, head_blob_count, protected_ok = classify_blobs(
+    print("Classifying historical JPEG/PNG paths and blobs...")
+    strip_ids, deleted_paths, strip_size, head_file_count, head_blob_count, protected_ok = classify_blobs(
         fresh_dir, invocation.target_rels, report_dir
     )
     if not protected_ok:
         raise RuntimeError("internal safety check failed: a HEAD target blob was selected for stripping")
 
     print("Running git-filter-repo in the cloned repository...")
-    run_filter_repo(fresh_dir, report_dir / "strip-blob-ids.txt", invocation.remote_url)
+    run_filter_repo(
+        fresh_dir,
+        report_dir / "strip-blob-ids.txt",
+        report_dir / "deleted-target-image-paths.txt",
+        invocation.remote_url,
+    )
 
     print("Recording post-cleanup repository state...")
     record_repo_state(fresh_dir, after_state, "After git-compress cleanup")
@@ -690,6 +750,7 @@ def main() -> int:
         after_state,
         args.push_chunk_size,
         len(strip_ids),
+        len(deleted_paths),
         strip_size,
         head_file_count,
         head_blob_count,
