@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
 
-IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
+DEFAULT_TARGET_EXTS = {".png", ".jpg", ".jpeg", ".pdf", ".doc", ".docx"}
 DEFAULT_PUSH_CHUNK_SIZE = 100
 
 
@@ -312,8 +312,34 @@ def clone_remote(invocation: Invocation, work_dir: Path) -> tuple[Path, Path, st
     return backup_dir, fresh_dir, expected_oid
 
 
-def is_image_path(path: str) -> bool:
-    return Path(path).suffix.lower() in IMAGE_EXTS
+def normalize_ext(value: str) -> str:
+    ext = value.strip().lower()
+    if not ext:
+        raise RuntimeError("--target-ext values must not be empty")
+    if not ext.startswith("."):
+        ext = "." + ext
+    if ext == ".":
+        raise RuntimeError("--target-ext values must include an extension name")
+    return ext
+
+
+def parse_target_exts(values: Sequence[str]) -> set[str]:
+    if not values:
+        return set(DEFAULT_TARGET_EXTS)
+
+    exts: set[str] = set()
+    for value in values:
+        for part in value.split(","):
+            exts.add(normalize_ext(part))
+    return exts
+
+
+def format_exts(exts: Iterable[str]) -> str:
+    return ", ".join(sorted(exts))
+
+
+def is_target_file_path(path: str, target_exts: set[str]) -> bool:
+    return Path(path).suffix.lower() in target_exts
 
 
 def parse_ls_tree_z(data: str) -> list[tuple[str, str]]:
@@ -328,12 +354,16 @@ def parse_ls_tree_z(data: str) -> list[tuple[str, str]]:
     return entries
 
 
-def head_image_blobs(repo: Path, pathspecs: Optional[Sequence[str]] = None) -> list[tuple[str, str]]:
+def head_target_file_blobs(
+    repo: Path,
+    target_exts: set[str],
+    pathspecs: Optional[Sequence[str]] = None,
+) -> list[tuple[str, str]]:
     args = ["git", "ls-tree", "-rz", "-r", "HEAD"]
     if pathspecs:
         args.extend(["--", *pathspecs])
     result = run(args, cwd=repo)
-    return [(oid, path) for oid, path in parse_ls_tree_z(result.stdout) if is_image_path(path)]
+    return [(oid, path) for oid, path in parse_ls_tree_z(result.stdout) if is_target_file_path(path, target_exts)]
 
 
 def head_paths(repo: Path) -> set[str]:
@@ -341,7 +371,11 @@ def head_paths(repo: Path) -> set[str]:
     return {path for path in result.stdout.split("\0") if path}
 
 
-def historical_image_paths(repo: Path, target_rels: Sequence[str]) -> set[str]:
+def historical_target_file_paths(
+    repo: Path,
+    target_rels: Sequence[str],
+    target_exts: set[str],
+) -> set[str]:
     result = run(
         [
             "git",
@@ -355,10 +389,14 @@ def historical_image_paths(repo: Path, target_rels: Sequence[str]) -> set[str]:
         ],
         cwd=repo,
     )
-    return {line.strip() for line in result.stdout.splitlines() if is_image_path(line.strip())}
+    return {line.strip() for line in result.stdout.splitlines() if is_target_file_path(line.strip(), target_exts)}
 
 
-def historical_image_blobs(repo: Path, target_rels: Sequence[str]) -> dict[str, set[str]]:
+def historical_target_file_blobs(
+    repo: Path,
+    target_rels: Sequence[str],
+    target_exts: set[str],
+) -> dict[str, set[str]]:
     result = run(["git", "rev-list", "--objects", "--all", "--", *target_rels], cwd=repo)
     blobs: dict[str, set[str]] = {}
     object_ids: set[str] = set()
@@ -370,7 +408,7 @@ def historical_image_blobs(repo: Path, target_rels: Sequence[str]) -> dict[str, 
         if len(cols) != 2:
             continue
         oid, path = cols
-        if not is_image_path(path):
+        if not is_target_file_path(path, target_exts):
             continue
         blobs.setdefault(oid, set()).add(path)
         object_ids.add(oid)
@@ -415,32 +453,33 @@ def object_sizes(repo: Path, object_ids: Iterable[str]) -> dict[str, int]:
 def classify_blobs(
     repo: Path,
     target_rels: Sequence[str],
+    target_exts: set[str],
     report_dir: Path,
 ) -> tuple[set[str], set[str], int, int, int, bool]:
-    head_target = head_image_blobs(repo, target_rels)
-    head_all = head_image_blobs(repo)
+    head_target = head_target_file_blobs(repo, target_exts, target_rels)
+    head_all = head_target_file_blobs(repo, target_exts)
     protected_head_paths = head_paths(repo)
-    historical_paths = historical_image_paths(repo, target_rels)
-    historical = historical_image_blobs(repo, target_rels)
+    historical_paths = historical_target_file_paths(repo, target_rels, target_exts)
+    historical = historical_target_file_blobs(repo, target_rels, target_exts)
 
     protected_head_blob_ids = {oid for oid, _ in head_all}
     head_target_blob_ids = {oid for oid, _ in head_target}
-    deleted_image_paths = historical_paths - protected_head_paths
+    deleted_target_file_paths = historical_paths - protected_head_paths
     strip_blob_ids = set(historical) - protected_head_blob_ids
     protected_ok = not (head_target_blob_ids & strip_blob_ids)
 
     strip_sizes = object_sizes(repo, strip_blob_ids)
     strip_size_total = sum(strip_sizes.values())
 
-    write_text(report_dir / "head-target-images.tsv", format_blob_paths(head_target))
-    write_text(report_dir / "head-all-images.tsv", format_blob_paths(head_all))
-    write_text(report_dir / "historical-target-image-paths.txt", format_paths(historical_paths))
-    write_text(report_dir / "deleted-target-image-paths.txt", format_paths(deleted_image_paths))
-    write_text(report_dir / "historical-target-image-blobs.tsv", format_historical_blobs(historical))
+    write_text(report_dir / "head-target-files.tsv", format_blob_paths(head_target))
+    write_text(report_dir / "head-all-target-files.tsv", format_blob_paths(head_all))
+    write_text(report_dir / "historical-target-file-paths.txt", format_paths(historical_paths))
+    write_text(report_dir / "deleted-target-file-paths.txt", format_paths(deleted_target_file_paths))
+    write_text(report_dir / "historical-target-file-blobs.tsv", format_historical_blobs(historical))
     write_text(report_dir / "strip-blob-ids.txt", "\n".join(sorted(strip_blob_ids)) + ("\n" if strip_blob_ids else ""))
     write_text(report_dir / "strip-blob-report.tsv", format_strip_blobs(historical, strip_sizes, strip_blob_ids))
 
-    return strip_blob_ids, deleted_image_paths, strip_size_total, len(head_target), len(head_target_blob_ids), protected_ok
+    return strip_blob_ids, deleted_target_file_paths, strip_size_total, len(head_target), len(head_target_blob_ids), protected_ok
 
 
 def format_paths(paths: Iterable[str]) -> str:
@@ -468,7 +507,13 @@ def format_strip_blobs(blobs: dict[str, set[str]], sizes: dict[str, int], strip_
     return "".join(lines)
 
 
-def run_filter_repo(repo: Path, strip_ids_file: Path, deleted_paths_file: Path, remote: str) -> None:
+def run_filter_repo(
+    repo: Path,
+    strip_ids_file: Path,
+    deleted_paths_file: Path,
+    remote: str,
+    target_exts: set[str],
+) -> None:
     if deleted_paths_file.stat().st_size > 0:
         run(
             [
@@ -482,12 +527,12 @@ def run_filter_repo(repo: Path, strip_ids_file: Path, deleted_paths_file: Path, 
             cwd=repo,
         )
     else:
-        print("No HEAD-absent historical JPEG/PNG paths need removing for the target directory.")
+        print(f"No HEAD-absent historical target-file paths need removing for: {format_exts(target_exts)}.")
 
     if strip_ids_file.stat().st_size > 0:
         run(["git", "filter-repo", "--force", "--strip-blobs-with-ids", str(strip_ids_file)], cwd=repo)
     else:
-        print("No historical JPEG/PNG blobs need stripping for the target directory.")
+        print(f"No historical target-file blobs need stripping for: {format_exts(target_exts)}.")
 
     remotes = run(["git", "remote"], cwd=repo).stdout.split()
     if "origin" not in remotes:
@@ -563,6 +608,7 @@ def push_rewritten_history(repo: Path, branch: str, expected_old_oid: str, push_
 def build_summary(
     path: Path,
     invocation: Invocation,
+    target_exts: set[str],
     work_dir: Path,
     backup_dir: Path,
     fresh_dir: Path,
@@ -573,8 +619,8 @@ def build_summary(
     strip_count: int,
     deleted_path_count: int,
     strip_size: int,
-    head_image_file_count: int,
-    head_image_blob_count: int,
+    head_target_file_count: int,
+    head_target_blob_count: int,
     protected_ok: bool,
     pushed: bool,
 ) -> None:
@@ -583,6 +629,7 @@ def build_summary(
         "",
         f"- Repository: `{invocation.repo_name}`",
         f"- Target directories: `{', '.join(invocation.target_rels)}`",
+        f"- Target extensions: `{format_exts(target_exts)}`",
         f"- Branch: `{invocation.branch}`",
         f"- Remote: `{invocation.remote_url}`",
         f"- Work directory: `{work_dir}`",
@@ -591,11 +638,11 @@ def build_summary(
         f"- Branch HEAD before rewrite: `{old_branch_head}`",
         f"- Rewritten history pushed: `{str(pushed).lower()}`",
         f"- Temporary preload push chunk size: `{push_chunk_size}`",
-        f"- HEAD-absent historical JPEG/PNG paths removed: `{deleted_path_count}`",
-        f"- JPEG/PNG blob IDs selected for removal: `{strip_count}`",
+        f"- HEAD-absent historical target-file paths removed: `{deleted_path_count}`",
+        f"- Target-file blob IDs selected for removal: `{strip_count}`",
         f"- Approximate historical blob bytes selected for removal: `{strip_size}`",
-        f"- HEAD JPEG/PNG files under target: `{head_image_file_count}`",
-        f"- HEAD JPEG/PNG unique blobs under target: `{head_image_blob_count}`",
+        f"- HEAD target files under target directories: `{head_target_file_count}`",
+        f"- HEAD target-file unique blobs under target directories: `{head_target_blob_count}`",
         f"- HEAD target blobs absent from strip list: `{str(protected_ok).lower()}`",
         "",
         "## State Reports",
@@ -605,11 +652,11 @@ def build_summary(
         "",
         "## Generated Files",
         "",
-        "- `head-target-images.tsv`",
-        "- `head-all-images.tsv`",
-        "- `historical-target-image-paths.txt`",
-        "- `deleted-target-image-paths.txt`",
-        "- `historical-target-image-blobs.tsv`",
+        "- `head-target-files.tsv`",
+        "- `head-all-target-files.tsv`",
+        "- `historical-target-file-paths.txt`",
+        "- `deleted-target-file-paths.txt`",
+        "- `historical-target-file-blobs.tsv`",
         "- `strip-blob-ids.txt`",
         "- `strip-blob-report.tsv`",
         "",
@@ -627,7 +674,7 @@ def build_summary(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Remove old JPEG/PNG blobs under target directories from Git history "
+            "Remove old target-file blobs under target directories from Git history "
             "in a freshly cloned repository and push the cleaned branch."
         )
     )
@@ -666,6 +713,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--target-ext",
+        "--target-exts",
+        action="append",
+        default=[],
+        metavar="EXT[,EXT...]",
+        help=(
+            "file extension(s) to remove from history; may be repeated "
+            f"(default: {format_exts(DEFAULT_TARGET_EXTS)})"
+        ),
+    )
+    parser.add_argument(
         "--no-push",
         action="store_true",
         help="do everything except pushing rewritten history",
@@ -687,6 +745,7 @@ def main() -> int:
     args = parse_args()
     if args.push_chunk_size < 0:
         raise RuntimeError("--push-chunk-size must be 0 or greater")
+    target_exts = parse_target_exts(args.target_ext)
     require_commands()
 
     invocation = resolve_invocation(args)
@@ -702,6 +761,7 @@ def main() -> int:
 
     print(f"Repository: {invocation.repo_name}")
     print(f"Target directories: {', '.join(invocation.target_rels)}")
+    print(f"Target extensions: {format_exts(target_exts)}")
     print(f"Branch: {invocation.branch}")
     print(f"Remote: {invocation.remote_url}")
     print(f"Work directory: {work_dir}")
@@ -712,9 +772,9 @@ def main() -> int:
     print("Recording cloned repository state...")
     record_repo_state(fresh_dir, before_state, "Before git-compress")
 
-    print("Classifying historical JPEG/PNG paths and blobs...")
+    print("Classifying historical target-file paths and blobs...")
     strip_ids, deleted_paths, strip_size, head_file_count, head_blob_count, protected_ok = classify_blobs(
-        fresh_dir, invocation.target_rels, report_dir
+        fresh_dir, invocation.target_rels, target_exts, report_dir
     )
     if not protected_ok:
         raise RuntimeError("internal safety check failed: a HEAD target blob was selected for stripping")
@@ -723,8 +783,9 @@ def main() -> int:
     run_filter_repo(
         fresh_dir,
         report_dir / "strip-blob-ids.txt",
-        report_dir / "deleted-target-image-paths.txt",
+        report_dir / "deleted-target-file-paths.txt",
         invocation.remote_url,
+        target_exts,
     )
 
     print("Recording post-cleanup repository state...")
@@ -742,6 +803,7 @@ def main() -> int:
     build_summary(
         summary,
         invocation,
+        target_exts,
         work_dir,
         backup_dir,
         fresh_dir,

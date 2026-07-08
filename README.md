@@ -1,6 +1,6 @@
 # cybergarage-pub-cleaner
 
-Tools for cleaning old PNG/JPEG blobs from cybergarage-pub history.
+Tools for cleaning old binary/document blobs from cybergarage-pub history.
 
 ## Usage
 
@@ -16,7 +16,18 @@ Clean multiple target directories in one history rewrite:
 ./git-compress cybergarage-pub shared books/wb/books/act books/wb/golf
 ```
 
-The command creates a `git-compress-*` work directory in the current directory by default. That work directory contains a mirror backup, reports, and a clean working clone. The command uses git-filter-repo outside the working repository to remove historical PNG/JPEG files under the target directories while protecting current HEAD files. It first removes historical image paths that are absent from HEAD, then strips historical image blob IDs that are not used by any current HEAD image. This path pass matters when a deleted image path reused the same blob as a current image at another path.
+By default, target files are selected by extension: `.doc`, `.docx`, `.jpeg`, `.jpg`, `.pdf`, and `.png`.
+
+Override the target extensions:
+
+```sh
+./git-compress cybergarage-pub books/retro --target-ext .pdf,.docx
+./git-compress cybergarage-pub books/retro --target-ext pdf --target-ext docx
+```
+
+When `--target-ext` is used, only the specified extensions are targeted.
+
+The command creates a `git-compress-*` work directory in the current directory by default. That work directory contains a mirror backup, reports, and a clean working clone. The command uses git-filter-repo outside the working repository to remove historical target files under the target directories while protecting current HEAD files. It first removes historical target-file paths that are absent from HEAD, then strips historical target-file blob IDs that are not used by any current HEAD target file. This path pass matters when a deleted target-file path reused the same blob as a current target file at another path.
 
 The command preloads the rewritten history through temporary branches before updating the target branch with --force-with-lease. This splits large history rewrites into smaller pushes to avoid GitHub's per-pack size limit. By default, the command does not pause for y/n confirmation before pushing. Use `--confirm` to require an interactive confirmation prompt. Use `--push-chunk-size <commits>` to change the preload chunk size, or `--push-chunk-size 0` to disable preloading. Use `--work-dir <path>` to choose an explicit work directory.
 
