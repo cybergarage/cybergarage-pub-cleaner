@@ -1,0 +1,65 @@
+name: Publish distribution
+on:
+  workflow_dispatch:
+    inputs:
+      destination:
+        description: Package index
+        type: choice
+        required: true
+        default: testpypi
+        options:
+          - testpypi
+          - pypi
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Require a matching release tag
+        env:
+          RELEASE_REF: ${{ github.ref }}
+        run: |
+          python - <<'PY'
+          import os, pathlib, tomllib
+          data = tomllib.loads(pathlib.Path('pyproject.toml').read_text())
+          expected = 'refs/tags/v' + data['project']['version']
+          assert os.environ['RELEASE_REF'] == expected, f'Run this workflow on {expected}'
+          PY
+      - run: python -m pip install '.[dev]'
+      - run: python -m unittest discover -s tests -v
+      - run: python -m build
+      - run: python -m twine check --strict dist/*
+      - name: Test wheel before upload
+        run: |
+          python -m venv /tmp/history-cleaner-wheel
+          /tmp/history-cleaner-wheel/bin/python -m pip install dist/*.whl
+          /tmp/history-cleaner-wheel/bin/python -m unittest discover -s tests -v
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.destination }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distributions
+          path: dist/
+      - name: Publish to TestPyPI
+        if: inputs.destination == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+      - name: Publish to PyPI
+        if: inputs.destination == 'pypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
